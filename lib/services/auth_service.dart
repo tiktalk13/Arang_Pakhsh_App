@@ -1,5 +1,5 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/user_model.dart';
 
 class AuthService {
@@ -12,6 +12,111 @@ class AuthService {
   // Auth state changes stream
   Stream<User?> get authStateChanges => _auth.authStateChanges();
 
+  // Original sign in method (for backward compatibility)
+  Future<User?> signInWithEmailAndPassword({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      UserCredential result = await _auth.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+      return result.user;
+    } on FirebaseAuthException catch (e) {
+      rethrow;
+    } catch (e) {
+      throw Exception('خطای غیرمنتظره در ورود: $e');
+    }
+  }
+
+  // Updated login method with role detection
+  Future<String?> loginUser(String email, String password) async {
+    try {
+      UserCredential result = await _auth.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+      
+      User user = result.user!;
+      
+      // Get user document from Firestore
+      DocumentSnapshot userDoc = await _db.collection('users').doc(user.uid).get();
+
+      if (userDoc.exists) {
+        Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
+        
+        // Check if user is active
+        bool isActive = userData['isActive'] ?? true;
+        if (!isActive) {
+          await _auth.signOut();
+          throw FirebaseAuthException(
+            code: 'user-disabled',
+            message: 'حساب کاربری شما غیرفعال شده است',
+          );
+        }
+        
+        // Update last login time
+        await _db.collection('users').doc(user.uid).update({
+          'lastLogin': FieldValue.serverTimestamp(),
+        });
+        
+        String role = userData['role'] ?? 'customer';
+        return role;
+      } else {
+        // If user document doesn't exist, create it with default role
+        await _db.collection('users').doc(user.uid).set({
+          'uid': user.uid,
+          'email': user.email,
+          'fullName': user.displayName ?? '',
+          'role': 'customer',
+          'isActive': true,
+          'createdAt': FieldValue.serverTimestamp(),
+          'lastLogin': FieldValue.serverTimestamp(),
+        });
+        
+        return 'customer';
+      }
+    } on FirebaseAuthException catch (e) {
+      // Re-throw Firebase Auth exceptions to maintain error handling
+      rethrow;
+    } catch (e) {
+      throw Exception('خطا در ورود: $e');
+    }
+  }
+
+  // Get user role
+  Future<String?> getUserRole(String uid) async {
+    try {
+      DocumentSnapshot userDoc = await _db.collection('users').doc(uid).get();
+      
+      if (userDoc.exists) {
+        Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
+        return userData['role'] as String?;
+      }
+      
+      return null;
+    } catch (e) {
+      throw Exception('خطا در دریافت نقش کاربر: $e');
+    }
+  }
+
+  // Get user data
+  Future<AppUser?> getUserData(String uid) async {
+    try {
+      DocumentSnapshot userDoc = await _db.collection('users').doc(uid).get();
+      
+      if (userDoc.exists) {
+        Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
+        return AppUser.fromMap(userData);
+      }
+      
+      return null;
+    } catch (e) {
+      throw Exception('خطا در دریافت اطلاعات کاربر: $e');
+    }
+  }
+
   // Register new user
   Future<AppUser?> registerUser({
     required String fullName,
@@ -22,238 +127,74 @@ class AuthService {
     String? address,
   }) async {
     try {
-      // Create user with email and password
       UserCredential result = await _auth.createUserWithEmailAndPassword(
         email: email,
         password: password,
       );
       
       User user = result.user!;
-
-      // Create AppUser object
-      AppUser appUser = AppUser(
+      
+      // Update display name
+      await user.updateDisplayName(fullName);
+      
+      // Create user document in Firestore
+      AppUser newUser = AppUser(
         uid: user.uid,
-        fullName: fullName,
         email: email,
+        fullName: fullName,
         role: role,
-        createdAt: DateTime.now(),
         phoneNumber: phoneNumber,
         address: address,
         isActive: true,
+        createdAt: DateTime.now(),
+        lastLogin: DateTime.now(),
       );
-
-      // Save user data to Firestore
-      await _db.collection('users').doc(user.uid).set(appUser.toMap());
-
-      // Update display name
-      await user.updateDisplayName(fullName);
-
-      return appUser;
+      
+      await _db.collection('users').doc(user.uid).set(newUser.toMap());
+      
+      return newUser;
     } on FirebaseAuthException catch (e) {
-      print('Registration Error: ${e.code} - ${e.message}');
       rethrow;
     } catch (e) {
-      print('Unexpected Registration Error: $e');
-      rethrow;
+      throw Exception('خطا در ثبت‌نام: $e');
     }
   }
 
-  // Sign in with email and password
-  Future<AppUser?> signInWithEmailAndPassword({
-    required String email,
-    required String password,
-  }) async {
+  // Update user role (Admin only)
+  Future<void> updateUserRole(String uid, String newRole) async {
     try {
-      UserCredential result = await _auth.signInWithEmailAndPassword(
-        email: email,
-        password: password,
-      );
-      
-      User user = result.user!;
-
-      // Update last login
-      await _db.collection('users').doc(user.uid).update({
-        'lastLogin': Timestamp.fromDate(DateTime.now()),
+      await _db.collection('users').doc(uid).update({
+        'role': newRole,
+        'updatedAt': FieldValue.serverTimestamp(),
       });
-
-      // Get user data from Firestore
-      AppUser appUser = await getUserData(user.uid);
-      
-      return appUser;
-    } on FirebaseAuthException catch (e) {
-      print('Login Error: ${e.code} - ${e.message}');
-      rethrow;
     } catch (e) {
-      print('Unexpected Login Error: $e');
-      rethrow;
+      throw Exception('خطا در به‌روزرسانی نقش کاربر: $e');
     }
   }
 
-  // Get user data from Firestore
-  Future<AppUser> getUserData(String uid) async {
+  // Activate/Deactivate user (Admin only)
+  Future<void> toggleUserStatus(String uid, bool isActive) async {
     try {
-      DocumentSnapshot doc = await _db.collection('users').doc(uid).get();
-      
-      if (doc.exists) {
-        return AppUser.fromDocument(doc);
-      } else {
-        throw Exception('User data not found');
-      }
+      await _db.collection('users').doc(uid).update({
+        'isActive': isActive,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
     } catch (e) {
-      print('Get User Data Error: $e');
-      rethrow;
+      throw Exception('خطا در تغییر وضعیت کاربر: $e');
     }
   }
 
-  // Update user profile
-  Future<void> updateUserProfile({
-    required String uid,
-    String? fullName,
-    String? phoneNumber,
-    String? address,
-    String? profileImageUrl,
-  }) async {
-    try {
-      Map<String, dynamic> updates = {};
-      
-      if (fullName != null) updates['fullName'] = fullName;
-      if (phoneNumber != null) updates['phoneNumber'] = phoneNumber;
-      if (address != null) updates['address'] = address;
-      if (profileImageUrl != null) updates['profileImageUrl'] = profileImageUrl;
-
-      if (updates.isNotEmpty) {
-        await _db.collection('users').doc(uid).update(updates);
-        
-        // Update Firebase Auth display name if changed
-        if (fullName != null && currentUser != null) {
-          await currentUser!.updateDisplayName(fullName);
-        }
-      }
-    } catch (e) {
-      print('Update Profile Error: $e');
-      rethrow;
-    }
-  }
-
-  // Sign out
-  Future<void> signOut() async {
-    try {
-      await _auth.signOut();
-    } catch (e) {
-      print('Sign Out Error: $e');
-      rethrow;
-    }
-  }
-
-  // Send password reset email
-  Future<void> sendPasswordResetEmail(String email) async {
-    try {
-      await _auth.sendPasswordResetEmail(email: email);
-    } on FirebaseAuthException catch (e) {
-      print('Password Reset Error: ${e.code} - ${e.message}');
-      rethrow;
-    } catch (e) {
-      print('Unexpected Password Reset Error: $e');
-      rethrow;
-    }
-  }
-
-  // Change password
-  Future<void> changePassword({
-    required String currentPassword,
-    required String newPassword,
-  }) async {
-    try {
-      User? user = currentUser;
-      if (user == null) throw Exception('No user logged in');
-
-      // Re-authenticate user
-      AuthCredential credential = EmailAuthProvider.credential(
-        email: user.email!,
-        password: currentPassword,
-      );
-      
-      await user.reauthenticateWithCredential(credential);
-      
-      // Update password
-      await user.updatePassword(newPassword);
-    } on FirebaseAuthException catch (e) {
-      print('Change Password Error: ${e.code} - ${e.message}');
-      rethrow;
-    } catch (e) {
-      print('Unexpected Change Password Error: $e');
-      rethrow;
-    }
-  }
-
-  // Delete user account
-  Future<void> deleteAccount(String currentPassword) async {
-    try {
-      User? user = currentUser;
-      if (user == null) throw Exception('No user logged in');
-
-      // Re-authenticate user
-      AuthCredential credential = EmailAuthProvider.credential(
-        email: user.email!,
-        password: currentPassword,
-      );
-      
-      await user.reauthenticateWithCredential(credential);
-      
-      // Delete user data from Firestore
-      await _db.collection('users').doc(user.uid).delete();
-      
-      // Delete user account
-      await user.delete();
-    } on FirebaseAuthException catch (e) {
-      print('Delete Account Error: ${e.code} - ${e.message}');
-      rethrow;
-    } catch (e) {
-      print('Unexpected Delete Account Error: $e');
-      rethrow;
-    }
-  }
-
-  // Check if user exists
-  Future<bool> userExists(String uid) async {
-    try {
-      DocumentSnapshot doc = await _db.collection('users').doc(uid).get();
-      return doc.exists;
-    } catch (e) {
-      print('User Exists Check Error: $e');
-      return false;
-    }
-  }
-
-  // Get all users (admin only)
+  // Get all users (Admin only)
   Future<List<AppUser>> getAllUsers() async {
     try {
       QuerySnapshot querySnapshot = await _db.collection('users').get();
       
-      return querySnapshot.docs.map((doc) => AppUser.fromDocument(doc)).toList();
+      return querySnapshot.docs.map((doc) {
+        Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
+        return AppUser.fromMap(data);
+      }).toList();
     } catch (e) {
-      print('Get All Users Error: $e');
-      rethrow;
-    }
-  }
-
-  // Update user role (admin only)
-  Future<void> updateUserRole(String uid, String newRole) async {
-    try {
-      await _db.collection('users').doc(uid).update({'role': newRole});
-    } catch (e) {
-      print('Update User Role Error: $e');
-      rethrow;
-    }
-  }
-
-  // Activate/Deactivate user (admin only)
-  Future<void> toggleUserStatus(String uid, bool isActive) async {
-    try {
-      await _db.collection('users').doc(uid).update({'isActive': isActive});
-    } catch (e) {
-      print('Toggle User Status Error: $e');
-      rethrow;
+      throw Exception('خطا در دریافت لیست کاربران: $e');
     }
   }
 
@@ -265,10 +206,65 @@ class AuthService {
           .where('role', isEqualTo: role)
           .get();
       
-      return querySnapshot.docs.map((doc) => AppUser.fromDocument(doc)).toList();
+      return querySnapshot.docs.map((doc) {
+        Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
+        return AppUser.fromMap(data);
+      }).toList();
     } catch (e) {
-      print('Get Users By Role Error: $e');
+      throw Exception('خطا در دریافت کاربران بر اساس نقش: $e');
+    }
+  }
+
+  // Sign out
+  Future<void> signOut() async {
+    try {
+      await _auth.signOut();
+    } catch (e) {
+      throw Exception('خطا در خروج از حساب کاربری: $e');
+    }
+  }
+
+  // Delete user account (Admin only)
+  Future<void> deleteUser(String uid) async {
+    try {
+      // Delete user document from Firestore
+      await _db.collection('users').doc(uid).delete();
+      
+      // Note: Firebase Auth user deletion requires the user to be currently signed in
+      // For admin deletion, you might need to use Firebase Admin SDK
+    } catch (e) {
+      throw Exception('خطا در حذف کاربر: $e');
+    }
+  }
+
+  // Reset password
+  Future<void> resetPassword(String email) async {
+    try {
+      await _auth.sendPasswordResetEmail(email: email);
+    } on FirebaseAuthException catch (e) {
       rethrow;
+    } catch (e) {
+      throw Exception('خطا در ارسال ایمیل بازیابی رمز عبور: $e');
+    }
+  }
+
+  // Check if user is admin
+  Future<bool> isAdmin(String uid) async {
+    try {
+      String? role = await getUserRole(uid);
+      return role == 'admin';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Check if user is seller
+  Future<bool> isSeller(String uid) async {
+    try {
+      String? role = await getUserRole(uid);
+      return role == 'sales' || role == 'seller';
+    } catch (e) {
+      return false;
     }
   }
 }
